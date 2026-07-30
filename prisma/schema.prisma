@@ -1,0 +1,680 @@
+// FixHub — Prisma schema
+// Implements Phase 2 (02-Database-Schema-API-Design.md) section 2 exactly.
+// Section references in comments below point back to that document so the
+// two never drift silently out of sync.
+
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "postgresql"
+  url      = env("DATABASE_URL")
+}
+
+// ─────────────────────────────────────────────────────────────
+// 2.1 Identity & Tenancy
+// ─────────────────────────────────────────────────────────────
+
+enum OrganizationType {
+  individual
+  property_management
+  hotel
+  hospital
+  school
+  mall
+  office
+  industrial
+}
+
+model Organization {
+  id                  String   @id @default(uuid())
+  name                String
+  type                OrganizationType
+  billingEmail        String   @map("billing_email")
+  spendApprovalLimit  Int?     @map("spend_approval_limit") // minor units; org-level default
+  createdAt           DateTime @default(now()) @map("created_at")
+  updatedAt           DateTime @updatedAt @map("updated_at")
+
+  memberships Membership[]
+  buildings   Building[]
+  jobs        Job[]
+  invoices    Invoice[]
+
+  @@map("organizations")
+}
+
+enum UserStatus {
+  active
+  suspended
+  pending_verification
+}
+
+enum PlatformRole {
+  admin
+}
+
+model User {
+  id            String        @id @default(uuid())
+  clerkUserId   String        @unique @map("clerk_user_id")
+  email         String        @unique
+  phone         String?
+  fullName      String        @map("full_name")
+  avatarUrl     String?       @map("avatar_url")
+  status        UserStatus    @default(active)
+  platformRole  PlatformRole? @map("platform_role")
+  createdAt     DateTime      @default(now()) @map("created_at")
+  updatedAt     DateTime      @updatedAt @map("updated_at")
+
+  memberships        Membership[]
+  contractorCompanyMemberships ContractorCompanyMembership[]
+  technician         Technician?
+  uploadedMedia       BuildingMedia[]     @relation("BuildingMediaUploader")
+  assetMediaUploads   AssetMedia[]        @relation("AssetMediaUploader")
+  jobsCreated         Job[]               @relation("JobCreator")
+  jobStatusChanges    JobStatusHistory[]  @relation("JobStatusChanger")
+  jobMediaUploads     JobMedia[]          @relation("JobMediaUploader")
+  messagesSent        Message[]           @relation("MessageSender")
+  notifications       Notification[]
+  reviewsWritten      Review[]            @relation("ReviewAuthor")
+  disputesRaised      Dispute[]           @relation("DisputeRaisedBy")
+  disputesResolved    Dispute[]           @relation("DisputeResolvedBy")
+  auditLogEntries     AuditLog[]          @relation("AuditActor")
+
+  @@map("users")
+}
+
+enum OrgRole {
+  owner
+  facility_manager
+  staff_viewer
+}
+
+model Membership {
+  id             String   @id @default(uuid())
+  userId         String   @map("user_id")
+  organizationId String   @map("organization_id")
+  role           OrgRole
+  buildingScope  String[] @map("building_scope") // empty array = all buildings
+  createdAt      DateTime @default(now()) @map("created_at")
+
+  user         User         @relation(fields: [userId], references: [id], onDelete: Cascade)
+  organization Organization @relation(fields: [organizationId], references: [id], onDelete: Cascade)
+
+  @@unique([userId, organizationId])
+  @@map("memberships")
+}
+
+enum VerificationStatus {
+  pending
+  verified
+  rejected
+  suspended
+}
+
+model ContractorCompany {
+  id                  String              @id @default(uuid())
+  name                String
+  verificationStatus  VerificationStatus  @default(pending) @map("verification_status")
+  serviceCategoryIds  String[]            @map("service_category_ids")
+  serviceRadiusKm     Int                 @map("service_radius_km")
+  baseLat             Float               @map("base_lat")
+  baseLng             Float               @map("base_lng")
+  ratingAvg           Float?              @map("rating_avg")
+  payoutAccount        Json?              @map("payout_account")
+  createdAt           DateTime            @default(now()) @map("created_at")
+  updatedAt           DateTime            @updatedAt @map("updated_at")
+
+  technicians Technician[]
+  memberships ContractorCompanyMembership[]
+  jobs        Job[]
+  payouts     ContractorPayout[]
+  reviews     Review[]
+  assets      Asset[]            @relation("AssetAssignedContractor")
+  quotations  Quotation[]
+
+  @@map("contractor_companies")
+}
+
+enum TechnicianStatus {
+  available
+  on_job
+  off_duty
+}
+
+model Technician {
+  id                  String            @id @default(uuid())
+  userId              String            @unique @map("user_id")
+  contractorCompanyId String            @map("contractor_company_id")
+  skillSubcategoryIds String[]          @map("skill_subcategory_ids")
+  status              TechnicianStatus  @default(off_duty)
+  currentLat          Float?            @map("current_lat")
+  currentLng          Float?            @map("current_lng")
+  createdAt           DateTime          @default(now()) @map("created_at")
+  updatedAt           DateTime          @updatedAt @map("updated_at")
+
+  user              User              @relation(fields: [userId], references: [id], onDelete: Cascade)
+  contractorCompany ContractorCompany @relation(fields: [contractorCompanyId], references: [id], onDelete: Cascade)
+  assignedJobs      Job[]             @relation("JobAssignedTechnician")
+
+  @@map("technicians")
+}
+
+// Closes the gap flagged at the end of Phase 6: Phase 4 section 3 always
+// described "contractor_admin" as a role distinct from "technician", but
+// the schema never modeled a row representing "the person who
+// administers this company" — only Technician existed. This mirrors
+// Membership (organizations) exactly, on purpose, so RequestContextService
+// and the frontend's UserIdentity/ContractorMembershipDto shapes can treat
+// organization and contractor identity symmetrically instead of the
+// contractor side being a special case.
+model ContractorCompanyMembership {
+  id                  String   @id @default(uuid())
+  userId              String   @map("user_id")
+  contractorCompanyId String   @map("contractor_company_id")
+  createdAt           DateTime @default(now()) @map("created_at")
+
+  user              User              @relation(fields: [userId], references: [id], onDelete: Cascade)
+  contractorCompany ContractorCompany @relation(fields: [contractorCompanyId], references: [id], onDelete: Cascade)
+
+  @@unique([userId, contractorCompanyId])
+  @@map("contractor_company_memberships")
+}
+
+// ─────────────────────────────────────────────────────────────
+// 2.2 Buildings & Assets
+// ─────────────────────────────────────────────────────────────
+
+model Building {
+  id             String    @id @default(uuid())
+  organizationId String    @map("organization_id")
+  name           String
+  address        String
+  lat            Float
+  lng            Float
+  buildingType   String    @map("building_type")
+  floors         Int?
+  units          Int?
+  createdAt      DateTime  @default(now()) @map("created_at")
+  updatedAt      DateTime  @updatedAt @map("updated_at")
+  deletedAt      DateTime? @map("deleted_at")
+
+  organization Organization    @relation(fields: [organizationId], references: [id], onDelete: Cascade)
+  assets       Asset[]
+  jobs         Job[]
+  media        BuildingMedia[]
+
+  @@map("buildings")
+  @@index([organizationId])
+}
+
+enum MediaType {
+  image
+  document
+}
+
+model BuildingMedia {
+  id         String    @id @default(uuid())
+  buildingId String    @map("building_id")
+  type       MediaType
+  s3Key      String    @map("s3_key")
+  uploadedBy String    @map("uploaded_by")
+  createdAt  DateTime  @default(now()) @map("created_at")
+
+  building Building @relation(fields: [buildingId], references: [id], onDelete: Cascade)
+  uploader User     @relation("BuildingMediaUploader", fields: [uploadedBy], references: [id])
+
+  @@map("building_media")
+}
+
+enum AssetType {
+  generator
+  hvac
+  elevator
+  water_pump
+  fire_pump
+  transformer
+  electrical_panel
+  solar_system
+  water_tank
+  other
+}
+
+model Asset {
+  id                          String     @id @default(uuid())
+  buildingId                  String     @map("building_id")
+  name                        String
+  assetType                   AssetType  @map("asset_type")
+  manufacturer                String?
+  model                       String?
+  serialNumber                String?    @map("serial_number")
+  installDate                 DateTime?  @map("install_date")
+  warrantyExpiry               DateTime?  @map("warranty_expiry")
+  assignedContractorCompanyId String?    @map("assigned_contractor_company_id")
+  createdAt                   DateTime   @default(now()) @map("created_at")
+  updatedAt                   DateTime   @updatedAt @map("updated_at")
+  deletedAt                   DateTime?  @map("deleted_at")
+
+  building              Building            @relation(fields: [buildingId], references: [id], onDelete: Cascade)
+  assignedContractor    ContractorCompany?  @relation("AssetAssignedContractor", fields: [assignedContractorCompanyId], references: [id])
+  media                 AssetMedia[]
+  maintenanceSchedules  MaintenanceSchedule[]
+  jobs                  Job[]
+
+  @@map("assets")
+  @@index([buildingId])
+}
+
+model AssetMedia {
+  id        String    @id @default(uuid())
+  assetId   String    @map("asset_id")
+  type      MediaType
+  s3Key     String    @map("s3_key")
+  uploadedBy String   @map("uploaded_by")
+  createdAt DateTime  @default(now()) @map("created_at")
+
+  asset    Asset @relation(fields: [assetId], references: [id], onDelete: Cascade)
+  uploader User  @relation("AssetMediaUploader", fields: [uploadedBy], references: [id])
+
+  @@map("asset_media")
+}
+
+enum Recurrence {
+  weekly
+  monthly
+  quarterly
+  biannual
+  annual
+}
+
+model MaintenanceSchedule {
+  id                    String     @id @default(uuid())
+  assetId               String     @map("asset_id")
+  serviceSubcategoryId  String     @map("service_subcategory_id")
+  recurrence            Recurrence
+  leadTimeDays          Int        @map("lead_time_days")
+  nextDueDate           DateTime   @map("next_due_date")
+  active                Boolean    @default(true)
+  createdAt             DateTime   @default(now()) @map("created_at")
+  updatedAt             DateTime   @updatedAt @map("updated_at")
+
+  asset               Asset               @relation(fields: [assetId], references: [id], onDelete: Cascade)
+  serviceSubcategory  ServiceSubcategory  @relation(fields: [serviceSubcategoryId], references: [id])
+
+  @@map("maintenance_schedules")
+}
+
+// ─────────────────────────────────────────────────────────────
+// 2.3 Service Catalog
+// ─────────────────────────────────────────────────────────────
+
+model ServiceCategory {
+  id   String @id @default(uuid())
+  name String @unique // Mechanical, Electrical, Civil, Fire Safety, Security, Cleaning, Landscaping, Elevators, General Repairs
+
+  subcategories ServiceSubcategory[]
+
+  @@map("service_categories")
+}
+
+model ServiceSubcategory {
+  id                  String   @id @default(uuid())
+  categoryId          String   @map("category_id")
+  name                String
+  requiresInspection  Boolean  @default(false) @map("requires_inspection")
+  defaultSlaHours     Int      @map("default_sla_hours")
+  basePriceRangeMin   Int?     @map("base_price_range_min")
+  basePriceRangeMax   Int?     @map("base_price_range_max")
+
+  category              ServiceCategory        @relation(fields: [categoryId], references: [id], onDelete: Cascade)
+  jobs                  Job[]
+  maintenanceSchedules  MaintenanceSchedule[]
+
+  @@unique([categoryId, name])
+  @@map("service_subcategories")
+}
+
+// ─────────────────────────────────────────────────────────────
+// 2.4 Jobs / Bookings — the central entity (Phase 2 section 2.4)
+// ─────────────────────────────────────────────────────────────
+
+enum JobSource {
+  manual
+  preventive_schedule
+  emergency
+}
+
+enum JobPriority {
+  normal
+  urgent
+  emergency
+}
+
+// Order matters — this is the literal state machine sequence enforced by
+// JobsService.transitionStatus(), see Phase 2 section 4.3.
+enum JobStatus {
+  submitted
+  assigned
+  en_route
+  arrived
+  in_progress
+  awaiting_approval
+  completed
+  closed
+  cancelled
+}
+
+model Job {
+  id                       String      @id @default(uuid())
+  organizationId           String      @map("organization_id")
+  buildingId               String      @map("building_id")
+  assetId                  String?     @map("asset_id")
+  serviceSubcategoryId     String      @map("service_subcategory_id")
+  createdByUserId          String      @map("created_by_user_id")
+  source                   JobSource   @default(manual)
+  priority                 JobPriority @default(normal)
+  description              String
+  status                   JobStatus   @default(submitted)
+  requiresInspection       Boolean     @map("requires_inspection")
+  contractorCompanyId      String?     @map("contractor_company_id")
+  assignedTechnicianId     String?     @map("assigned_technician_id")
+  preferredDate            DateTime?   @map("preferred_date")
+  preferredTimeWindow      String?     @map("preferred_time_window")
+  cancelledReason          String?     @map("cancelled_reason")
+  createdAt                DateTime    @default(now()) @map("created_at")
+  updatedAt                DateTime    @updatedAt @map("updated_at")
+
+  organization         Organization        @relation(fields: [organizationId], references: [id])
+  building              Building            @relation(fields: [buildingId], references: [id])
+  asset                 Asset?              @relation(fields: [assetId], references: [id])
+  serviceSubcategory    ServiceSubcategory  @relation(fields: [serviceSubcategoryId], references: [id])
+  createdBy              User                @relation("JobCreator", fields: [createdByUserId], references: [id])
+  contractorCompany      ContractorCompany?  @relation(fields: [contractorCompanyId], references: [id])
+  assignedTechnician     Technician?         @relation("JobAssignedTechnician", fields: [assignedTechnicianId], references: [id])
+
+  statusHistory JobStatusHistory[]
+  media         JobMedia[]
+  quotations    Quotation[]
+  invoice       Invoice?
+  messages      Message[]
+  review        Review?
+  disputes      Dispute[]
+  payouts       ContractorPayout[]
+
+  @@map("jobs")
+  // Postgres doesn't auto-index foreign key scalar columns the way some
+  // other engines do, and these three are exactly what JobsService.list()
+  // and the Contractors/Admin modules filter on for every request — see
+  // 05-Testing-Optimization-Deployment.md section 2.1.
+  @@index([organizationId, status])
+  @@index([contractorCompanyId, status])
+  @@index([buildingId])
+}
+
+model JobStatusHistory {
+  id             String    @id @default(uuid())
+  jobId          String    @map("job_id")
+  status         JobStatus
+  changedByUserId String?  @map("changed_by_user_id")
+  note           String?
+  createdAt      DateTime  @default(now()) @map("created_at")
+
+  job         Job   @relation(fields: [jobId], references: [id], onDelete: Cascade)
+  changedBy   User? @relation("JobStatusChanger", fields: [changedByUserId], references: [id])
+
+  @@map("job_status_history")
+}
+
+enum JobMediaType {
+  issue_photo
+  issue_video
+  before_photo
+  after_photo
+  report_pdf
+  signature
+}
+
+model JobMedia {
+  id         String       @id @default(uuid())
+  jobId      String       @map("job_id")
+  type       JobMediaType
+  s3Key      String       @map("s3_key")
+  uploadedBy String       @map("uploaded_by")
+  createdAt  DateTime     @default(now()) @map("created_at")
+
+  job      Job  @relation(fields: [jobId], references: [id], onDelete: Cascade)
+  uploader User @relation("JobMediaUploader", fields: [uploadedBy], references: [id])
+
+  @@map("job_media")
+}
+
+enum QuotationStatus {
+  draft
+  submitted
+  approved
+  revision_requested
+  declined
+}
+
+model Quotation {
+  id                   String          @id @default(uuid())
+  jobId                String          @map("job_id")
+  contractorCompanyId  String          @map("contractor_company_id")
+  status               QuotationStatus @default(draft)
+  subtotal             Int
+  tax                  Int
+  total                Int
+  currency             String
+  validUntil            DateTime?      @map("valid_until")
+  notes                String?
+  createdAt            DateTime        @default(now()) @map("created_at")
+  updatedAt            DateTime        @updatedAt @map("updated_at")
+
+  job                Job                 @relation(fields: [jobId], references: [id], onDelete: Cascade)
+  contractorCompany  ContractorCompany   @relation(fields: [contractorCompanyId], references: [id])
+  lineItems          QuotationLineItem[]
+  invoice            Invoice?
+
+  @@map("quotations")
+}
+
+model QuotationLineItem {
+  id           String  @id @default(uuid())
+  quotationId  String  @map("quotation_id")
+  description  String
+  quantity     Float
+  unitPrice    Int     @map("unit_price")
+  lineTotal    Int     @map("line_total")
+
+  quotation Quotation @relation(fields: [quotationId], references: [id], onDelete: Cascade)
+
+  @@map("quotation_line_items")
+}
+
+// ─────────────────────────────────────────────────────────────
+// 2.5 Payments & Billing
+// ─────────────────────────────────────────────────────────────
+
+enum InvoiceStatus {
+  draft
+  issued
+  paid
+  overdue
+  void
+}
+
+model Invoice {
+  id             String        @id @default(uuid())
+  jobId          String        @unique @map("job_id")
+  organizationId String        @map("organization_id")
+  quotationId    String?       @unique @map("quotation_id")
+  status         InvoiceStatus @default(draft)
+  total          Int
+  currency       String
+  dueDate        DateTime?     @map("due_date")
+  createdAt      DateTime      @default(now()) @map("created_at")
+  updatedAt      DateTime      @updatedAt @map("updated_at")
+
+  job          Job           @relation(fields: [jobId], references: [id])
+  organization Organization  @relation(fields: [organizationId], references: [id])
+  quotation    Quotation?    @relation(fields: [quotationId], references: [id])
+  payments     Payment[]
+
+  @@map("invoices")
+}
+
+enum PaymentProvider {
+  stripe
+  paystack
+  flutterwave
+}
+
+enum PaymentStatus {
+  pending
+  succeeded
+  failed
+  refunded
+}
+
+model Payment {
+  id                 String          @id @default(uuid())
+  invoiceId          String          @map("invoice_id")
+  provider           PaymentProvider
+  providerReference  String          @unique @map("provider_reference")
+  amount             Int
+  currency           String
+  status             PaymentStatus   @default(pending)
+  paidAt             DateTime?       @map("paid_at")
+  createdAt          DateTime        @default(now()) @map("created_at")
+
+  invoice Invoice @relation(fields: [invoiceId], references: [id], onDelete: Cascade)
+
+  @@map("payments")
+}
+
+enum PayoutStatus {
+  pending
+  paid
+  failed
+}
+
+model ContractorPayout {
+  id                  String        @id @default(uuid())
+  contractorCompanyId String        @map("contractor_company_id")
+  jobId               String        @map("job_id")
+  amount              Int
+  status              PayoutStatus  @default(pending)
+  providerReference   String?       @map("provider_reference")
+  createdAt           DateTime      @default(now()) @map("created_at")
+  updatedAt           DateTime      @updatedAt @map("updated_at")
+
+  contractorCompany ContractorCompany @relation(fields: [contractorCompanyId], references: [id])
+  job               Job               @relation(fields: [jobId], references: [id])
+
+  @@map("contractor_payouts")
+}
+
+// ─────────────────────────────────────────────────────────────
+// 2.6 Communication
+// ─────────────────────────────────────────────────────────────
+
+model Message {
+  id        String   @id @default(uuid())
+  jobId     String   @map("job_id")
+  senderId  String   @map("sender_id")
+  body      String
+  createdAt DateTime @default(now()) @map("created_at")
+
+  job    Job  @relation(fields: [jobId], references: [id], onDelete: Cascade)
+  sender User @relation("MessageSender", fields: [senderId], references: [id])
+
+  @@map("messages")
+}
+
+enum NotificationChannel {
+  email
+  sms
+  whatsapp
+  push
+}
+
+model Notification {
+  id        String              @id @default(uuid())
+  userId    String              @map("user_id")
+  eventType String              @map("event_type")
+  channel   NotificationChannel @default(email)
+  payload   Json
+  readAt    DateTime?           @map("read_at")
+  sentAt    DateTime?           @map("sent_at")
+  createdAt DateTime            @default(now()) @map("created_at")
+
+  user User @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@map("notifications")
+  @@index([userId, readAt])
+}
+
+// ─────────────────────────────────────────────────────────────
+// 2.7 Reviews & Admin
+// ─────────────────────────────────────────────────────────────
+
+model Review {
+  id                   String   @id @default(uuid())
+  jobId                String   @unique @map("job_id")
+  reviewerUserId       String   @map("reviewer_user_id")
+  contractorCompanyId  String   @map("contractor_company_id")
+  professionalism      Int
+  communication        Int
+  quality              Int
+  punctuality          Int
+  overall              Int
+  comment              String?
+  createdAt            DateTime @default(now()) @map("created_at")
+
+  job               Job               @relation(fields: [jobId], references: [id])
+  reviewer          User              @relation("ReviewAuthor", fields: [reviewerUserId], references: [id])
+  contractorCompany ContractorCompany @relation(fields: [contractorCompanyId], references: [id])
+
+  @@map("reviews")
+}
+
+enum DisputeStatus {
+  open
+  investigating
+  resolved
+  dismissed
+}
+
+model Dispute {
+  id                 String        @id @default(uuid())
+  jobId              String        @map("job_id")
+  raisedByUserId     String        @map("raised_by_user_id")
+  status             DisputeStatus @default(open)
+  reason             String
+  resolutionNote     String?       @map("resolution_note")
+  resolvedByAdminId  String?       @map("resolved_by_admin_id")
+  createdAt          DateTime      @default(now()) @map("created_at")
+  updatedAt          DateTime      @updatedAt @map("updated_at")
+
+  job           Job   @relation(fields: [jobId], references: [id])
+  raisedBy      User  @relation("DisputeRaisedBy", fields: [raisedByUserId], references: [id])
+  resolvedBy    User? @relation("DisputeResolvedBy", fields: [resolvedByAdminId], references: [id])
+
+  @@map("disputes")
+}
+
+// Added in Phase 4 (auth-user-roles.md section 6) — auth-driven security
+// concern, not part of the original Phase 2 core schema.
+model AuditLog {
+  id           String   @id @default(uuid())
+  actorUserId  String   @map("actor_user_id")
+  action       String
+  targetType   String   @map("target_type")
+  targetId     String   @map("target_id")
+  metadata     Json?
+  createdAt    DateTime @default(now()) @map("created_at")
+
+  actor User @relation("AuditActor", fields: [actorUserId], references: [id])
+
+  @@map("audit_log")
+}
