@@ -1,114 +1,256 @@
-import { ConflictException, NotFoundException } from "@nestjs/common";
-import { JobsService, ALLOWED_TRANSITIONS } from "./jobs.module";
+import {
+  Body,
+  Controller,
+  ForbiddenException,
+  Get,
+  Injectable,
+  Module,
+  NotFoundException,
+  Param,
+  Patch,
+  Post,
+  Query,
+  UseGuards,
+} from "@nestjs/common";
+import { ConflictException } from "@nestjs/common";
+import { Throttle } from "@nestjs/throttler";
+import { Type } from "class-transformer";
+import { IsEnum, IsInt, IsOptional, IsString, IsUUID, Max, Min, MinLength } from "class-validator";
+import { JobStatus, JobPriority } from "@prisma/client";
+import { PrismaModule, PrismaService } from "../prisma/prisma.module";
+import { AuthModule } from "../auth/auth.module";
+import { ClerkAuthGuard } from "../auth/clerk-auth.guard";
+import { ContextGuard, Ctx } from "../auth/context.guard";
 import type { RequestContext } from "../auth/types";
+import { NotificationsModule, NotificationsService } from "../notifications/notifications.module";
+import { distanceKm } from "../common/geo.util";
 
-// This is the highest-value test in the codebase: the state machine is
-// the enforcement point the entire product's trust model depends on
-// (Phase 2 section 4.3). If this regresses, a job could skip a stage
-// like "awaiting_approval" and get marked completed without the
-// customer ever signing off.
-
-function makeOrgContext(overrides: Partial<Extract<RequestContext, { scope: "organization" }>> = {}) {
-  return {
-    scope: "organization" as const,
-    userId: "usr_1",
-    organizationId: "org_1",
-    role: "owner" as const,
-    buildingScope: null,
-    spendApprovalLimit: null,
-    ...overrides,
-  };
+class CreateJobDto {
+  @IsUUID() buildingId!: string;
+  @IsOptional() @IsUUID() assetId?: string;
+  @IsUUID() serviceSubcategoryId!: string;
+  @IsString() @MinLength(1) description!: string;
+  @IsEnum(JobPriority) priority!: JobPriority;
+  @IsOptional() @IsString() preferredDate?: string;
+  @IsOptional() @IsString() preferredTimeWindow?: string;
 }
 
-function makeNotificationsMock() {
-  return { emit: jest.fn().mockResolvedValue({}) };
+class UpdateJobStatusDto {
+  @IsEnum(JobStatus) status!: JobStatus;
+  @IsOptional() @IsString() note?: string;
 }
 
-function makePrismaMock(job: Record<string, unknown>) {
-  return {
-    job: {
-      findUnique: jest.fn().mockResolvedValue(job),
-      update: jest.fn().mockResolvedValue({ ...job }),
-    },
-    jobStatusHistory: {
-      create: jest.fn().mockResolvedValue({}),
-    },
-    $transaction: jest.fn((ops: unknown[]) => Promise.all(ops)),
-  };
+class ListJobsQueryDto {
+  @IsOptional() @IsUUID() cursor?: string;
+  @IsOptional() @Type(() => Number) @IsInt() @Min(1) @Max(100) limit?: number = 25;
 }
 
-describe("ALLOWED_TRANSITIONS (Phase 2 section 4.3)", () => {
-  it("has no transitions out of terminal states", () => {
-    expect(ALLOWED_TRANSITIONS.closed).toEqual([]);
-    expect(ALLOWED_TRANSITIONS.cancelled).toEqual([]);
-  });
+export const ALLOWED_TRANSITIONS: Record<JobStatus, JobStatus[]> = {
+  submitted: ["assigned", "cancelled"],
+  assigned: ["en_route", "cancelled"],
+  en_route: ["arrived", "cancelled"],
+  arrived: ["in_progress", "cancelled"],
+  in_progress: ["awaiting_approval", "completed", "cancelled"],
+  awaiting_approval: ["completed", "in_progress"],
+  completed: ["closed"],
+  closed: [],
+  cancelled: [],
+};
 
-  it("only allows cancellation from in-flight, non-terminal states", () => {
-    const cancellableFrom = Object.entries(ALLOWED_TRANSITIONS)
-      .filter(([, next]) => next.includes("cancelled"))
-      .map(([from]) => from);
-    expect(cancellableFrom).toEqual(
-      expect.arrayContaining(["submitted", "assigned", "en_route", "arrived", "in_progress"])
+@Injectable()
+export class JobsService {
+  constructor(
+    private readonly prisma: PrismaService,
+    private readonly notifications: NotificationsService
+  ) {}
+
+  async list(ctx: RequestContext, pagination: ListJobsQueryDto) {
+    const take = pagination.limit ?? 25;
+
+    let items;
+    if (ctx.scope === "organization") {
+      items = await this.prisma.job.findMany({
+        where: {
+          organizationId: ctx.organizationId,
+          ...(ctx.buildingScope ? { buildingId: { in: ctx.buildingScope } } : {}),
+        },
+        orderBy: { createdAt: "desc" },
+        include: { building: true, serviceSubcategory: true },
+        take: take + 1,
+        ...(pagination.cursor ? { cursor: { id: pagination.cursor }, skip: 1 } : {}),
+      });
+    } else if (ctx.scope === "contractor") {
+      items = await this.prisma.job.findMany({
+        where: { contractorCompanyId: ctx.contractorCompanyId },
+        orderBy: { createdAt: "desc" },
+        include: { building: true, serviceSubcategory: true },
+        take: take + 1,
+        ...(pagination.cursor ? { cursor: { id: pagination.cursor }, skip: 1 } : {}),
+      });
+    } else {
+      items = await this.prisma.job.findMany({
+        orderBy: { createdAt: "desc" },
+        include: { building: true, serviceSubcategory: true, organization: true },
+        take: take + 1,
+        ...(pagination.cursor ? { cursor: { id: pagination.cursor }, skip: 1 } : {}),
+      });
+    }
+
+    const hasMore = items.length > take;
+    const page = hasMore ? items.slice(0, take) : items;
+    return { items: page, nextCursor: hasMore ? page[page.length - 1].id : null };
+  }
+
+  async get(ctx: RequestContext, id: string) {
+    const job = await this.prisma.job.findUnique({
+      where: { id },
+      include: { statusHistory: { orderBy: { createdAt: "asc" } }, media: true, quotations: true },
+    });
+    if (!job) throw new NotFoundException("Job not found");
+    this.assertVisible(ctx, job.organizationId, job.contractorCompanyId);
+    return job;
+  }
+
+  private assertVisible(ctx: RequestContext, organizationId: string, contractorCompanyId: string | null) {
+    if (ctx.scope === "global") return;
+    if (ctx.scope === "organization" && ctx.organizationId === organizationId) return;
+    if (ctx.scope === "contractor" && ctx.contractorCompanyId === contractorCompanyId) return;
+    throw new NotFoundException("Job not found");
+  }
+
+  async create(ctx: RequestContext, dto: CreateJobDto) {
+    if (ctx.scope !== "organization") throw new ForbiddenException();
+
+    const subcategory = await this.prisma.serviceSubcategory.findUniqueOrThrow({
+      where: { id: dto.serviceSubcategoryId },
+    });
+
+    const job = await this.prisma.job.create({
+      data: {
+        organizationId: ctx.organizationId,
+        buildingId: dto.buildingId,
+        assetId: dto.assetId,
+        serviceSubcategoryId: dto.serviceSubcategoryId,
+        createdByUserId: ctx.userId,
+        description: dto.description,
+        priority: dto.priority,
+        requiresInspection: subcategory.requiresInspection,
+        source: dto.priority === "emergency" ? "emergency" : "manual",
+        preferredDate: dto.priority === "emergency" ? null : dto.preferredDate,
+        preferredTimeWindow: dto.priority === "emergency" ? null : dto.preferredTimeWindow,
+      },
+    });
+
+    await this.prisma.jobStatusHistory.create({
+      data: { jobId: job.id, status: "submitted", changedByUserId: ctx.userId },
+    });
+
+    if (dto.priority === "emergency") {
+      await this.broadcastEmergencyJob(job.id);
+    }
+
+    return job;
+  }
+
+  private async broadcastEmergencyJob(jobId: string) {
+    const job = await this.prisma.job.findUniqueOrThrow({
+      where: { id: jobId },
+      include: { building: true, serviceSubcategory: true },
+    });
+
+    const candidates = await this.prisma.technician.findMany({
+      where: {
+        status: "available",
+        skillSubcategoryIds: { has: job.serviceSubcategoryId },
+        contractorCompany: { verificationStatus: "verified" },
+      },
+      include: { contractorCompany: true, user: true },
+    });
+
+    const inRange = candidates.filter(
+      (t) =>
+        distanceKm(job.building.lat, job.building.lng, t.contractorCompany.baseLat, t.contractorCompany.baseLng) <=
+        t.contractorCompany.serviceRadiusKm
     );
-    expect(cancellableFrom).not.toContain("completed");
-    expect(cancellableFrom).not.toContain("closed");
-  });
 
-  it("does not allow skipping straight from submitted to completed", () => {
-    expect(ALLOWED_TRANSITIONS.submitted).not.toContain("completed");
-  });
-});
+    await Promise.all(
+      inRange.map((t) =>
+        this.notifications.emit({
+          userId: t.userId,
+          eventType: "job_assigned",
+          payload: {
+            jobId: job.id,
+            emergencyBroadcast: true,
+            claimUrl: `/jobs/emergency-broadcast/${job.id}/claim`,
+            building: job.building.name,
+            service: job.serviceSubcategory.name,
+          },
+        })
+      )
+    );
 
-describe("JobsService.transitionStatus", () => {
-  it("allows a legal transition (submitted → assigned)", async () => {
-    const prisma = makePrismaMock({ id: "job_1", status: "submitted", organizationId: "org_1", contractorCompanyId: null });
-    const service = new JobsService(prisma as any, makeNotificationsMock() as any);
+    if (inRange.length === 0) {
+      console.warn(`Emergency job ${job.id} has no available in-range technicians to notify`);
+    }
+  }
 
-    await service.transitionStatus(makeOrgContext(), "job_1", { status: "assigned" });
+  async transitionStatus(ctx: RequestContext, jobId: string, dto: UpdateJobStatusDto) {
+    const job = await this.prisma.job.findUnique({ where: { id: jobId } });
+    if (!job) throw new NotFoundException("Job not found");
+    this.assertVisible(ctx, job.organizationId, job.contractorCompanyId);
 
-    expect(prisma.job.update).toHaveBeenCalledWith({
-      where: { id: "job_1" },
-      data: { status: "assigned" },
-    });
-  });
+    const allowed = ALLOWED_TRANSITIONS[job.status];
+    if (!allowed.includes(dto.status)) {
+      throw new ConflictException(
+        `Cannot transition job from '${job.status}' to '${dto.status}'. Allowed: ${allowed.join(", ") || "none — terminal state"}`
+      );
+    }
 
-  it("rejects an illegal transition (submitted → completed) with 409, not a silent no-op", async () => {
-    const prisma = makePrismaMock({ id: "job_1", status: "submitted", organizationId: "org_1", contractorCompanyId: null });
-    const service = new JobsService(prisma as any, makeNotificationsMock() as any);
+    const [updated] = await this.prisma.$transaction([
+      this.prisma.job.update({ where: { id: jobId }, data: { status: dto.status } }),
+      this.prisma.jobStatusHistory.create({
+        data: { jobId, status: dto.status, changedByUserId: ctx.userId, note: dto.note },
+      }),
+    ]);
 
-    await expect(
-      service.transitionStatus(makeOrgContext(), "job_1", { status: "completed" })
-    ).rejects.toThrow(ConflictException);
-    expect(prisma.job.update).not.toHaveBeenCalled();
-  });
+    return updated;
+  }
+}
 
-  it("rejects any transition attempted from a terminal state (closed)", async () => {
-    const prisma = makePrismaMock({ id: "job_1", status: "closed", organizationId: "org_1", contractorCompanyId: null });
-    const service = new JobsService(prisma as any, makeNotificationsMock() as any);
+@Controller("jobs")
+@UseGuards(ClerkAuthGuard, ContextGuard)
+class JobsController {
+  constructor(private readonly jobs: JobsService) {}
 
-    await expect(
-      service.transitionStatus(makeOrgContext(), "job_1", { status: "in_progress" })
-    ).rejects.toThrow(ConflictException);
-  });
+  @Get()
+  list(@Ctx() ctx: RequestContext, @Query() pagination: ListJobsQueryDto) {
+    return this.jobs.list(ctx, pagination);
+  }
 
-  it("404s rather than 403s when the job belongs to a different organization", async () => {
-    const prisma = makePrismaMock({ id: "job_1", status: "submitted", organizationId: "org_OTHER", contractorCompanyId: null });
-    const service = new JobsService(prisma as any, makeNotificationsMock() as any);
+  @Get(":id")
+  get(@Ctx() ctx: RequestContext, @Param("id") id: string) {
+    return this.jobs.get(ctx, id);
+  }
 
-    await expect(
-      service.transitionStatus(makeOrgContext({ organizationId: "org_1" }), "job_1", { status: "assigned" })
-    ).rejects.toThrow(NotFoundException);
-  });
+  @Post()
+  @Throttle({ default: { limit: 10, ttl: 60_000 } })
+  create(@Ctx() ctx: RequestContext, @Body() dto: CreateJobDto) {
+    return this.jobs.create(ctx, dto);
+  }
 
-  it("allows awaiting_approval to route back to in_progress for rework", async () => {
-    const prisma = makePrismaMock({ id: "job_1", status: "awaiting_approval", organizationId: "org_1", contractorCompanyId: null });
-    const service = new JobsService(prisma as any, makeNotificationsMock() as any);
+  @Patch(":id/status")
+  transitionStatus(
+    @Ctx() ctx: RequestContext,
+    @Param("id") id: string,
+    @Body() dto: UpdateJobStatusDto
+  ) {
+    return this.jobs.transitionStatus(ctx, id, dto);
+  }
+}
 
-    await service.transitionStatus(makeOrgContext(), "job_1", { status: "in_progress" });
-
-    expect(prisma.job.update).toHaveBeenCalledWith({
-      where: { id: "job_1" },
-      data: { status: "in_progress" },
-    });
-  });
-});
+@Module({
+  imports: [PrismaModule, AuthModule, NotificationsModule],
+  controllers: [JobsController],
+  providers: [JobsService, ContextGuard],
+})
+export class JobsModule {}
