@@ -11,7 +11,7 @@ import {
   UseGuards,
 } from "@nestjs/common";
 import { IsEnum, IsOptional, IsString } from "class-validator";
-import { DisputeStatus, UserStatus, VerificationStatus } from "@prisma/client";
+import { DisputeStatus, Prisma, UserStatus, VerificationStatus } from "@prisma/client";
 import { PrismaModule, PrismaService } from "../prisma/prisma.module";
 import { AuthModule } from "../auth/auth.module";
 import { ClerkAuthGuard } from "../auth/clerk-auth.guard";
@@ -32,11 +32,6 @@ class ResolveDisputeDto {
   @IsOptional() @IsString() resolutionNote?: string;
 }
 
-// Every method here requires ctx.scope === 'global' — see Phase 4
-// section 2.5: there is no self-serve path into this role, and every
-// handler re-asserts it rather than trusting the route was reachable
-// (defense in depth even though ContextGuard + the frontend's route
-// guard already gate the /admin portal).
 function assertAdmin(ctx: RequestContext) {
   if (ctx.scope !== "global") throw new ForbiddenException("Admin access required");
 }
@@ -79,25 +74,13 @@ class AdminService {
         action: "contractor_verification_changed",
         targetType: "contractor_company",
         targetId: id,
-        metadata: { newStatus: dto.status },
+        metadata: { newStatus: dto.status } as Prisma.InputJsonValue,
       },
     });
 
-    // NOTE(schema gap): Phase 4 section 3 defines a distinct
-    // "contractor_admin" role, but Phase 2's schema only models
-    // Technician (always role=technician) against a ContractorCompany —
-    // there's no membership row representing "the person who administers
-    // this company." Emitting a real "contractor verification changed"
-    // notification needs that recipient, so this is left as an explicit
-    // gap rather than notifying an arbitrary technician, which would be
-    // wrong more often than it's right. Fixing this means adding a
-    // ContractorCompanyMembership model (mirroring Membership for
-    // organizations) in a schema migration — flagging for your review
-    // rather than silently picking a workaround.
     return updated;
   }
 
-  /** Cross-tenant job view — matches Phase 3 section 3.12's admin override UI. */
   async listAllJobs(ctx: RequestContext) {
     assertAdmin(ctx);
     return this.prisma.job.findMany({
