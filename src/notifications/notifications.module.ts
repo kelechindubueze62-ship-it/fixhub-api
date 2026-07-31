@@ -4,11 +4,8 @@ import { AuthModule } from "../auth/auth.module";
 import { ClerkAuthGuard } from "../auth/clerk-auth.guard";
 import { ContextGuard, Ctx } from "../auth/context.guard";
 import type { RequestContext } from "../auth/types";
-import { NotificationChannel } from "@prisma/client";
+import { NotificationChannel, Prisma } from "@prisma/client";
 
-// The event vocabulary is the exact table from Phase 1 section 8 — every
-// entry there should have a matching literal here so nothing gets added
-// to the spec without a corresponding emit() call site, and vice versa.
 export type NotificationEventType =
   | "job_assigned"
   | "technician_en_route"
@@ -27,11 +24,6 @@ interface EmitParams {
   payload: Record<string, unknown>;
 }
 
-// Channel adapter interface — same pattern as PaymentProvider (Phase 1
-// section 11.2 established this pattern first; applied here too). v1
-// ships EmailChannelAdapter only; SMS/WhatsApp/push in v1.1 are new files
-// implementing this same interface, per Phase 1 section 8 and Phase 3's
-// "coming soon" tag in Settings rather than hiding the option.
 interface ChannelAdapter {
   readonly channel: NotificationChannel;
   send(to: string, eventType: NotificationEventType, payload: Record<string, unknown>): Promise<void>;
@@ -40,9 +32,6 @@ interface ChannelAdapter {
 class EmailChannelAdapter implements ChannelAdapter {
   readonly channel = "email" as const;
   async send(to: string, eventType: NotificationEventType, payload: Record<string, unknown>) {
-    // Real implementation sends via a transactional email provider (e.g.
-    // Postmark/SES). Logging here keeps this vertical slice runnable
-    // without external email credentials.
     console.log(`[email → ${to}] ${eventType}`, payload);
   }
 }
@@ -53,10 +42,14 @@ export class NotificationsService {
 
   constructor(private readonly prisma: PrismaService) {}
 
-  /** Called from other modules' TODO(Phase 6 cont'd) markers. */
   async emit({ userId, eventType, payload }: EmitParams) {
     const notification = await this.prisma.notification.create({
-      data: { userId, eventType, channel: "email", payload },
+      data: {
+        userId,
+        eventType,
+        channel: "email",
+        payload: payload as Prisma.InputJsonValue,
+      },
     });
 
     const user = await this.prisma.user.findUnique({ where: { id: userId } });
